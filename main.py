@@ -7,9 +7,12 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import requests
+
+APP_VERSION = "metrics-bot-v3-lean-ui-2026-07-02"
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -92,8 +95,8 @@ class Config:
     activity_after: str
     activity_types: Tuple[str, ...]
     activity_max_pages_per_type: int
+    cash_flow_activity_debug_limit: int
     net_deposits_override: Optional[float]
-
     request_timeout_seconds: float
     request_retries: int
     request_sleep_seconds: float
@@ -136,8 +139,11 @@ def load_config() -> Config:
         portfolio_history_timeframe=os.getenv("PORTFOLIO_HISTORY_TIMEFRAME", "1D").strip(),
         portfolio_history_extended_hours=getenv_bool("PORTFOLIO_HISTORY_EXTENDED_HOURS", False),
         activity_after=os.getenv("ACTIVITY_AFTER", "1970-01-01").strip(),
-        activity_types=getenv_csv("CASH_FLOW_ACTIVITY_TYPES", "CSD,CSW,TRANS,JNLC,ACATC,ACATS"),
-        activity_max_pages_per_type=getenv_int("ACTIVITY_MAX_PAGES_PER_TYPE", 20),
+        # Default to direct external-cash activity types. Avoid TRANS by default because it can overlap
+        # with CSD/CSW and cause double-counting on some accounts.
+        activity_types=getenv_csv("CASH_FLOW_ACTIVITY_TYPES", "CSD,CSW,ACATC,JNLC"),
+        activity_max_pages_per_type=getenv_int("ACTIVITY_MAX_PAGES_PER_TYPE", 100),
+        cash_flow_activity_debug_limit=getenv_int("CASH_FLOW_ACTIVITY_DEBUG_LIMIT", 12),
         net_deposits_override=getenv_optional_float("NET_DEPOSITS_OVERRIDE"),
         request_timeout_seconds=getenv_float("REQUEST_TIMEOUT_SECONDS", 12.0),
         request_retries=getenv_int("REQUEST_RETRIES", 3),
@@ -415,20 +421,18 @@ def get_account_activities_by_type(
 
 
 def position_metrics(raw_positions: Sequence[Dict[str, Any]], equity: float) -> Dict[str, Any]:
-    positions: List[Dict[str, Any]] = []
     total_market_value = 0.0
     total_unrealized_pl = 0.0
     red_positions = 0
     green_positions = 0
+    largest_loser: Optional[Dict[str, Any]] = None
+    largest_winner: Optional[Dict[str, Any]] = None
 
     for p in raw_positions:
         symbol = clean_symbol(p.get("symbol"))
         market_value = to_float(p.get("market_value"), 0.0)
         unrealized_pl = to_float(p.get("unrealized_pl"), 0.0)
         unrealized_plpc = to_optional_float(p.get("unrealized_plpc"))
-        cost_basis = to_float(p.get("cost_basis"), 0.0)
-        qty = to_float(p.get("qty"), 0.0)
-        exposure_pct = pct(abs(market_value), equity) if equity else None
 
         if unrealized_pl < 0:
             red_positions += 1
@@ -437,40 +441,29 @@ def position_metrics(raw_positions: Sequence[Dict[str, Any]], equity: float) -> 
 
         total_market_value += market_value
         total_unrealized_pl += unrealized_pl
-        positions.append(
-            {
+
+        if unrealized_plpc is not None:
+            compact = {
                 "symbol": symbol,
-                "asset_class": p.get("asset_class"),
-                "side": p.get("side"),
-                "qty": qty,
-                "market_value": market_value,
-                "cost_basis": cost_basis,
-                "current_price": to_optional_float(p.get("current_price")),
-                "avg_entry_price": to_optional_float(p.get("avg_entry_price")),
                 "unrealized_pl": unrealized_pl,
                 "unrealized_plpc": unrealized_plpc,
-                "exposure_pct_of_equity": exposure_pct,
+                "market_value": market_value,
             }
-        )
-
-    top_by_exposure = sorted(positions, key=lambda x: abs(to_float(x.get("market_value"), 0.0)), reverse=True)[:10]
-    losers = [p for p in positions if p.get("unrealized_plpc") is not None]
-    largest_loser = min(losers, key=lambda x: to_float(x.get("unrealized_plpc"), 0.0), default=None)
-    largest_winner = max(losers, key=lambda x: to_float(x.get("unrealized_plpc"), 0.0), default=None)
+            if largest_loser is None or unrealized_plpc < to_float(largest_loser.get("unrealized_plpc"), 0.0):
+                largest_loser = compact
+            if largest_winner is None or unrealized_plpc > to_float(largest_winner.get("unrealized_plpc"), 0.0):
+                largest_winner = compact
 
     return {
-        "positions_count": len(positions),
+        "positions_count": len(raw_positions),
         "red_positions": red_positions,
         "green_positions": green_positions,
-        "flat_positions": len(positions) - red_positions - green_positions,
+        "flat_positions": len(raw_positions) - red_positions - green_positions,
         "total_market_value": total_market_value,
         "total_unrealized_pl": total_unrealized_pl,
-        "top_by_exposure": top_by_exposure,
         "largest_loser": largest_loser,
         "largest_winner": largest_winner,
-        "positions": sorted(positions, key=lambda x: to_float(x.get("unrealized_plpc"), 0.0)),
     }
-
 
 def history_metrics(history: Dict[str, Any]) -> Dict[str, Any]:
     raw_equity = history.get("equity") or []
@@ -510,46 +503,114 @@ def history_metrics(history: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def first_number_from_activity(activity: Dict[str, Any]) -> Optional[float]:
-    for key in ("net_amount", "amount", "cash", "price"):
+    """Return the best cash amount field for a non-trade activity.
+
+    Do not use price/qty here: those are trade fields and can accidentally turn fills into
+    fake cash flows if activity filters are changed later.
+    """
+    for key in ("net_amount", "amount", "cash", "cash_amount"):
         value = to_optional_float(activity.get(key))
         if value is not None:
             return value
     return None
 
 
-def cashflow_from_activity(activity: Dict[str, Any]) -> float:
-    activity_type = str(activity.get("activity_type") or activity.get("entry_type") or activity.get("type") or "").upper()
+def activity_type_of(activity: Dict[str, Any]) -> str:
+    return str(activity.get("activity_type") or activity.get("entry_type") or activity.get("type") or "").upper()
+
+
+def activity_date_of(activity: Dict[str, Any]) -> str:
+    for key in ("date", "transaction_time", "created_at", "updated_at"):
+        raw = activity.get(key)
+        if raw:
+            return str(raw)
+    return ""
+
+
+def activity_text(activity: Dict[str, Any]) -> str:
+    parts = []
+    for key in ("activity_type", "entry_type", "type", "description", "status", "note"):
+        value = activity.get(key)
+        if value is not None:
+            parts.append(str(value))
+    return " ".join(parts).lower()
+
+
+def activity_dedupe_key(activity: Dict[str, Any], amount: float) -> str:
+    """Stable key for activity dedupe.
+
+    Alpaca activity IDs are preferred. The fallback signature protects the calculation from
+    occasional overlapping category/type pulls where the same cash event is returned without
+    the same ID.
+    """
+    activity_id = str(activity.get("id") or "").strip()
+    if activity_id:
+        return f"id:{activity_id}"
+    day = activity_date_of(activity)[:10]
+    activity_type = activity_type_of(activity)
+    return f"sig:{day}:{activity_type}:{amount:.2f}:{str(activity.get('description') or '')[:40]}"
+
+
+def classify_cashflow_activity(activity: Dict[str, Any]) -> Tuple[float, str, str]:
+    """Return (signed external cash flow, category, note).
+
+    Positive means money came into the account from outside. Negative means money left the
+    account. Dividends, interest, fees, fills, and market P/L are intentionally excluded because
+    those are investment results, not funding.
+    """
+    activity_type = activity_type_of(activity)
     amount = first_number_from_activity(activity)
     if amount is None:
-        return 0.0
+        return 0.0, "ignored", "no cash amount field"
 
-    if activity_type in {"CSD"}:
-        return abs(amount)
-    if activity_type in {"CSW"}:
-        return -abs(amount)
+    text = activity_text(activity)
 
-    # Journals / transfers / ACAT cash activity are usually signed already. Preserve sign.
-    if activity_type in {"TRANS", "JNLC", "JNL", "ACATC", "ACATS"}:
-        return amount
+    # Direct deposit/withdrawal types are the cleanest source.
+    if activity_type == "CSD" or " cash deposit" in text or "ach deposit" in text or "csd" in text:
+        return abs(amount), "deposit", "direct deposit activity"
+    if activity_type == "CSW" or " cash withdrawal" in text or "ach withdrawal" in text or "csw" in text:
+        return -abs(amount), "withdrawal", "direct withdrawal activity"
 
-    return 0.0
+    # Cash ACATS and cash journals/transfers are usually signed. Preserve sign.
+    if activity_type in {"ACATC", "JNLC", "JNL", "TRANS"}:
+        if amount > 0:
+            return amount, "deposit", f"signed {activity_type} cash activity"
+        if amount < 0:
+            return amount, "withdrawal", f"signed {activity_type} cash activity"
+        return 0.0, "ignored", f"zero {activity_type} amount"
+
+    return 0.0, "ignored", f"ignored activity type {activity_type}"
 
 
 def cash_flow_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     if cfg.net_deposits_override is not None:
+        net = cfg.net_deposits_override
         return {
             "source": "NET_DEPOSITS_OVERRIDE",
-            "net_deposits": cfg.net_deposits_override,
-            "deposits": max(cfg.net_deposits_override, 0.0),
-            "withdrawals": abs(min(cfg.net_deposits_override, 0.0)),
+            "net_deposits": net,
+            "net_funding": net,
+            "deposits": max(net, 0.0),
+            "withdrawals": abs(min(net, 0.0)),
             "activity_count": 0,
+            "raw_activity_count": 0,
+            "duplicate_activity_count": 0,
+            "ignored_activity_count": 0,
             "activity_types_checked": list(cfg.activity_types),
+            "activity_after": cfg.activity_after,
+            "first_cash_flow_date": None,
+            "last_cash_flow_date": None,
+            "recent_cash_flows": [],
             "notes": "Using NET_DEPOSITS_OVERRIDE from environment variables.",
         }
 
     deposits = 0.0
     withdrawals = 0.0
-    activity_count = 0
+    raw_activity_count = 0
+    duplicate_activity_count = 0
+    ignored_activity_count = 0
+    seen: Set[str] = set()
+    cashflow_events: List[Dict[str, Any]] = []
+    activity_type_counts: Dict[str, int] = {}
 
     for activity_type in cfg.activity_types:
         try:
@@ -559,24 +620,62 @@ def cash_flow_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
             continue
 
         for activity in activities:
-            amount = cashflow_from_activity(activity)
-            if amount > 0:
-                deposits += amount
-            elif amount < 0:
-                withdrawals += abs(amount)
-            if amount != 0:
-                activity_count += 1
+            if not isinstance(activity, dict):
+                continue
+            raw_activity_count += 1
+            signed_amount, category, note = classify_cashflow_activity(activity)
+            actual_type = activity_type_of(activity) or activity_type
+            activity_type_counts[actual_type] = activity_type_counts.get(actual_type, 0) + 1
+
+            if signed_amount == 0:
+                ignored_activity_count += 1
+                continue
+
+            key = activity_dedupe_key(activity, signed_amount)
+            if key in seen:
+                duplicate_activity_count += 1
+                continue
+            seen.add(key)
+
+            if signed_amount > 0:
+                deposits += signed_amount
+            else:
+                withdrawals += abs(signed_amount)
+
+            cashflow_events.append(
+                {
+                    "date": activity_date_of(activity),
+                    "activity_type": actual_type,
+                    "amount": signed_amount,
+                    "category": category,
+                    "id": activity.get("id"),
+                    "note": note,
+                }
+            )
+
+    cashflow_events.sort(key=lambda x: str(x.get("date") or ""))
+    limit = max(0, cfg.cash_flow_activity_debug_limit)
 
     return {
-        "source": "account_activities",
+        "source": "account_activities_deduped",
         "net_deposits": deposits - withdrawals,
+        "net_funding": deposits - withdrawals,
         "deposits": deposits,
         "withdrawals": withdrawals,
-        "activity_count": activity_count,
+        "activity_count": len(cashflow_events),
+        "raw_activity_count": raw_activity_count,
+        "duplicate_activity_count": duplicate_activity_count,
+        "ignored_activity_count": ignored_activity_count,
+        "activity_type_counts": activity_type_counts,
         "activity_types_checked": list(cfg.activity_types),
+        "activity_after": cfg.activity_after,
+        "first_cash_flow_date": cashflow_events[0].get("date") if cashflow_events else None,
+        "last_cash_flow_date": cashflow_events[-1].get("date") if cashflow_events else None,
+        "recent_cash_flows": cashflow_events[-limit:] if limit else [],
         "notes": (
-            "Calculated from Alpaca account activities. If this looks wrong, set NET_DEPOSITS_OVERRIDE "
-            "to your true deposits minus withdrawals."
+            "External funding is calculated as deposits minus withdrawals from deduped Alpaca cash activities. "
+            "It intentionally excludes fills, dividends, interest, fees, and market P/L. If this still does not "
+            "match your real funding history, set NET_DEPOSITS_OVERRIDE to your true deposits minus withdrawals."
         ),
     }
 
@@ -602,15 +701,18 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     positions = position_metrics(positions_raw, equity)
     hist = history_metrics(history)
 
+    total_deposits = to_float(cashflows.get("deposits"), 0.0)
+    total_withdrawals = to_float(cashflows.get("withdrawals"), 0.0)
     net_deposits = to_float(cashflows.get("net_deposits"), 0.0)
-    cash_flow_adjusted_pnl: Optional[float]
-    cash_flow_adjusted_return: Optional[float]
-    if net_deposits > 0:
-        cash_flow_adjusted_pnl = equity - net_deposits
-        cash_flow_adjusted_return = cash_flow_adjusted_pnl / net_deposits
-    else:
-        cash_flow_adjusted_pnl = None
-        cash_flow_adjusted_return = None
+
+    # This is the most robust simple funding-adjusted P/L formula when the account has
+    # been withdrawn to zero and later re-funded:
+    #   lifetime P/L = current equity + all withdrawals - all deposits
+    # It is equivalent to equity - net funding, but the expanded formula is easier to audit.
+    lifetime_pnl = equity + total_withdrawals - total_deposits
+    cash_flow_adjusted_pnl: Optional[float] = lifetime_pnl
+    cash_flow_adjusted_return: Optional[float] = lifetime_pnl / net_deposits if net_deposits > 0 else None
+    return_on_total_deposits: Optional[float] = lifetime_pnl / total_deposits if total_deposits > 0 else None
 
     day_pnl = equity - last_equity if last_equity is not None else None
     day_return = pct(day_pnl, last_equity) if day_pnl is not None and last_equity else None
@@ -642,11 +744,16 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
         },
         "cash_flows": cashflows,
         "profitability": {
+            "total_deposits": total_deposits,
+            "total_withdrawals": total_withdrawals,
             "net_deposits": net_deposits,
+            "net_funding": net_deposits,
+            "lifetime_pnl": lifetime_pnl,
             "cash_flow_adjusted_pnl": cash_flow_adjusted_pnl,
             "cash_flow_adjusted_return": cash_flow_adjusted_return,
+            "return_on_total_deposits": return_on_total_deposits,
             "unrealized_pl_open_positions": positions["total_unrealized_pl"],
-            "notes": "Cash-flow-adjusted P/L is equity minus net deposits. This is the main scorecard metric.",
+            "notes": "Lifetime P/L is equity plus withdrawals minus deposits. Return on total deposits is usually clearer when the account has had withdrawals/re-funding.",
         },
         "positions": positions,
         "history": hist,
@@ -655,12 +762,14 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     largest_loser = positions.get("largest_loser") or {}
     largest_winner = positions.get("largest_winner") or {}
     log.info(
-        "Metrics refreshed mode=%s equity=%.2f net_deposits=%.2f cfa_pnl=%s cfa_return=%s positions=%d red=%d green=%d day_pnl=%s largest_loser=%s:%s largest_winner=%s:%s",
+        "Metrics refreshed mode=%s equity=%.2f deposits=%.2f withdrawals=%.2f net_funding=%.2f lifetime_pnl=%s return_on_deposits=%s positions=%d red=%d green=%d day_pnl=%s largest_loser=%s:%s largest_winner=%s:%s",
         metrics["mode"],
         equity,
+        total_deposits,
+        total_withdrawals,
         net_deposits,
-        fmt_money(cash_flow_adjusted_pnl),
-        fmt_pct(cash_flow_adjusted_return),
+        fmt_money(lifetime_pnl),
+        fmt_pct(return_on_total_deposits),
         positions["positions_count"],
         positions["red_positions"],
         positions["green_positions"],
@@ -735,32 +844,6 @@ def metric_card(title: str, value: str, sub: str = "") -> str:
     """
 
 
-def render_positions_table(rows: Sequence[Dict[str, Any]], limit: int = 25) -> str:
-    if not rows:
-        return "<p>No open positions.</p>"
-    body = []
-    for p in rows[:limit]:
-        pl = to_float(p.get("unrealized_pl"), 0.0)
-        plpc = p.get("unrealized_plpc")
-        klass = "neg" if pl < 0 else "pos" if pl > 0 else ""
-        body.append(
-            "<tr>"
-            f"<td>{safe_text(p.get('symbol'))}</td>"
-            f"<td>{safe_text(p.get('asset_class') or '')}</td>"
-            f"<td class='num'>{fmt_num(p.get('qty'), 4)}</td>"
-            f"<td class='num'>{fmt_money(p.get('market_value'))}</td>"
-            f"<td class='num {klass}'>{fmt_money(pl)}</td>"
-            f"<td class='num {klass}'>{fmt_pct(plpc)}</td>"
-            f"<td class='num'>{fmt_pct(p.get('exposure_pct_of_equity'))}</td>"
-            "</tr>"
-        )
-    return """
-    <table>
-      <thead><tr><th>Symbol</th><th>Class</th><th>Qty</th><th>Market Value</th><th>Unrealized P/L</th><th>Unrealized %</th><th>Exposure</th></tr></thead>
-      <tbody>
-    """ + "\n".join(body) + "</tbody></table>"
-
-
 def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config) -> str:
     account = metrics.get("account", {})
     profitability = metrics.get("profitability", {})
@@ -774,27 +857,25 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
     warning = ""
     if not cfg.dashboard_token:
         warning = "<div class='warning'>DASHBOARD_TOKEN is not set. This Railway web dashboard is unprotected.</div>"
-    if cash_flows.get("source") == "account_activities" and to_float(cash_flows.get("net_deposits"), 0.0) <= 0:
-        warning += "<div class='warning'>Net deposits could not be confidently calculated from activities. Set NET_DEPOSITS_OVERRIDE to your true deposits minus withdrawals if this looks wrong.</div>"
+    if cash_flows.get("source", "").startswith("account_activities") and to_float(cash_flows.get("deposits"), 0.0) <= 0:
+        warning += "<div class='warning'>No deposit activity was found. Check CASH_FLOW_ACTIVITY_TYPES / ACTIVITY_AFTER, or set NET_DEPOSITS_OVERRIDE if the funding number looks wrong.</div>"
 
     cards = "\n".join(
         [
             metric_card("Equity", fmt_money(account.get("equity")), f"Mode: {metrics.get('mode', 'unknown')}"),
-            metric_card("Cash-flow adjusted P/L", fmt_money(profitability.get("cash_flow_adjusted_pnl")), "Equity - net deposits"),
-            metric_card("Cash-flow adjusted return", fmt_pct(profitability.get("cash_flow_adjusted_return")), "Main scorecard"),
-            metric_card("Net deposits", fmt_money(profitability.get("net_deposits")), f"Source: {cash_flows.get('source')}"),
+            metric_card("Lifetime P/L", fmt_money(profitability.get("lifetime_pnl")), "Equity + withdrawals - deposits"),
+            metric_card("Return on deposits", fmt_pct(profitability.get("return_on_total_deposits")), "Lifetime P/L / total deposits"),
+            metric_card("Net funding", fmt_money(profitability.get("net_funding")), f"Source: {cash_flows.get('source')}"),
+            metric_card("Total deposits", fmt_money(profitability.get("total_deposits")), f"Since {cash_flows.get('activity_after', 'start')}"),
+            metric_card("Total withdrawals", fmt_money(profitability.get("total_withdrawals")), f"Cash-flow events: {cash_flows.get('activity_count', 0)}"),
             metric_card("Day P/L", fmt_money(account.get("day_pnl")), fmt_pct(account.get("day_return"))),
             metric_card("Buying power", fmt_money(account.get("buying_power")), f"Reg-T: {fmt_money(account.get('regt_buying_power'))}"),
             metric_card("Open unrealized P/L", fmt_money(profitability.get("unrealized_pl_open_positions")), f"Positions: {positions.get('positions_count', 0)}"),
             metric_card("Red / Green", f"{positions.get('red_positions', 0)} / {positions.get('green_positions', 0)}", "Open positions"),
             metric_card("Current drawdown", fmt_pct(history.get("current_drawdown")), f"Max: {fmt_pct(history.get('max_drawdown'))}"),
-            metric_card("Largest loser", safe_text(largest_loser.get("symbol") or "—"), fmt_pct(largest_loser.get("unrealized_plpc")) if largest_loser else "—"),
-            metric_card("Largest winner", safe_text(largest_winner.get("symbol") or "—"), fmt_pct(largest_winner.get("unrealized_plpc")) if largest_winner else "—"),
+            metric_card("Largest loser / winner", f"{safe_text(largest_loser.get('symbol') or '—')} / {safe_text(largest_winner.get('symbol') or '—')}", f"{fmt_pct(largest_loser.get('unrealized_plpc')) if largest_loser else '—'} / {fmt_pct(largest_winner.get('unrealized_plpc')) if largest_winner else '—'}"),
         ]
     )
-
-    top_exposure = render_positions_table(positions.get("top_by_exposure") or [], limit=10)
-    worst_positions = render_positions_table(positions.get("positions") or [], limit=25)
 
     json_url = "/api/metrics"
     refresh_url = "/refresh"
@@ -837,19 +918,18 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
     <body>
       <header>
         <h1>Alpaca Metrics Bot</h1>
-        <div class="muted">Generated at {safe_text(metrics.get('generated_at'))}. Last refresh finished {safe_text(state.get('last_refresh_finished_at'))}. Auto-refreshes every {int(max(10, cfg.web_refresh_seconds))} seconds.</div>
+        <div class="muted">Version: {safe_text(metrics.get('app_version'))}. Generated at {safe_text(metrics.get('generated_at'))}. Last refresh finished {safe_text(state.get('last_refresh_finished_at'))}. Auto-refreshes every {int(max(10, cfg.web_refresh_seconds))} seconds.</div>
       </header>
       {warning}
       <section class="grid">{cards}</section>
       <main>
-        <h2>Top exposure</h2>
-        {top_exposure}
-        <h2>Worst positions first</h2>
-        {worst_positions}
         <div class="footer">
           <p>JSON: <a href="{json_url}">{json_url}</a> · Force refresh: <a href="{refresh_url}">{refresh_url}</a></p>
           <p>{safe_text(token_note)}</p>
-          <p>Cash-flow adjusted P/L is only as good as the deposit/withdrawal data. Set NET_DEPOSITS_OVERRIDE if Alpaca activities do not match your actual funding history.</p>
+          <p>Lifetime P/L uses: current equity + total withdrawals - total deposits. The funding calculation is deduped and excludes fills, dividends, interest, fees, and market P/L.</p>
+          <p>Cash-flow activity types checked: {safe_text(','.join(cash_flows.get('activity_types_checked') or []))}. Raw activities: {safe_text(cash_flows.get('raw_activity_count'))}; duplicates skipped: {safe_text(cash_flows.get('duplicate_activity_count'))}; ignored: {safe_text(cash_flows.get('ignored_activity_count'))}.</p>
+          <p>Set NET_DEPOSITS_OVERRIDE only if Alpaca activities still do not match your actual funding history.</p>
+          <p>Version: {safe_text(metrics.get('app_version'))}. If you still see Top exposure or Worst positions first, Railway is still serving the older deployment.</p>
         </div>
       </main>
     </body>
@@ -915,6 +995,16 @@ def api_metrics(request: Request) -> JSONResponse:
     return JSONResponse(metrics)
 
 
+
+
+@app.get("/api/cashflows")
+def api_cashflows(request: Request) -> JSONResponse:
+    config = cfg()
+    require_dashboard_token(request, config)
+    metrics = get_cached_or_refresh(config)
+    return JSONResponse(metrics.get("cash_flows", {}))
+
+
 @app.get("/refresh")
 def refresh(request: Request) -> JSONResponse:
     config = cfg()
@@ -934,8 +1024,14 @@ def healthz() -> Dict[str, Any]:
     return {
         "status": "ok" if not state.get("last_error") else "degraded",
         "service": "alpaca-metrics-bot",
+        "version": APP_VERSION,
         **state,
     }
+
+
+@app.get("/version")
+def version() -> Dict[str, str]:
+    return {"service": "alpaca-metrics-bot", "version": APP_VERSION}
 
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
