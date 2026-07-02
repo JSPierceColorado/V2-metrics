@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import requests
 
-APP_VERSION = "metrics-bot-v3-lean-ui-2026-07-02"
+APP_VERSION = "metrics-bot-v4-tooltips-charts-expectancy-2026-07-02"
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -96,6 +96,11 @@ class Config:
     activity_types: Tuple[str, ...]
     activity_max_pages_per_type: int
     cash_flow_activity_debug_limit: int
+
+    trade_activity_after: str
+    trade_activity_max_pages: int
+    trade_debug_limit: int
+
     net_deposits_override: Optional[float]
     request_timeout_seconds: float
     request_retries: int
@@ -144,6 +149,9 @@ def load_config() -> Config:
         activity_types=getenv_csv("CASH_FLOW_ACTIVITY_TYPES", "CSD,CSW,ACATC,JNLC"),
         activity_max_pages_per_type=getenv_int("ACTIVITY_MAX_PAGES_PER_TYPE", 100),
         cash_flow_activity_debug_limit=getenv_int("CASH_FLOW_ACTIVITY_DEBUG_LIMIT", 12),
+        trade_activity_after=os.getenv("TRADE_ACTIVITY_AFTER", os.getenv("ACTIVITY_AFTER", "1970-01-01")).strip(),
+        trade_activity_max_pages=getenv_int("TRADE_ACTIVITY_MAX_PAGES", 100),
+        trade_debug_limit=getenv_int("TRADE_DEBUG_LIMIT", 20),
         net_deposits_override=getenv_optional_float("NET_DEPOSITS_OVERRIDE"),
         request_timeout_seconds=getenv_float("REQUEST_TIMEOUT_SECONDS", 12.0),
         request_retries=getenv_int("REQUEST_RETRIES", 3),
@@ -382,13 +390,18 @@ def get_account_activities_by_type(
     session: requests.Session,
     cfg: Config,
     activity_type: str,
+    *,
+    after: Optional[str] = None,
+    max_pages: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     activities: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
+    effective_after = after if after is not None else cfg.activity_after
+    effective_max_pages = max_pages if max_pages is not None else cfg.activity_max_pages_per_type
 
-    for page in range(max(1, cfg.activity_max_pages_per_type)):
+    for page in range(max(1, effective_max_pages)):
         params: Dict[str, Any] = {
-            "after": cfg.activity_after,
+            "after": effective_after,
             "direction": "asc",
             "page_size": 100,
         }
@@ -482,12 +495,14 @@ def history_metrics(history: Dict[str, Any]) -> Dict[str, Any]:
     max_drawdown: Optional[float] = None
     current_drawdown: Optional[float] = None
     high_water_mark: Optional[float] = None
+    drawdown_series: List[Tuple[Optional[str], float]] = []
 
-    for _, eq in equity_series:
+    for ts, eq in equity_series:
         if peak is None or eq > peak:
             peak = eq
         dd = (eq - peak) / peak if peak else None
         if dd is not None:
+            drawdown_series.append((ts, dd))
             if max_drawdown is None or dd < max_drawdown:
                 max_drawdown = dd
             current_drawdown = dd
@@ -498,7 +513,8 @@ def history_metrics(history: Dict[str, Any]) -> Dict[str, Any]:
         "high_water_mark": high_water_mark,
         "current_drawdown": current_drawdown,
         "max_drawdown": max_drawdown,
-        "equity_series": equity_series[-30:],
+        "equity_series": equity_series[-60:],
+        "drawdown_series": drawdown_series[-60:],
     }
 
 
@@ -680,6 +696,248 @@ def cash_flow_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     }
 
 
+
+def parse_activity_time(activity: Dict[str, Any]) -> Tuple[float, str]:
+    for key in ("transaction_time", "date", "created_at", "updated_at"):
+        raw = activity.get(key)
+        if not raw:
+            continue
+        text = str(raw)
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp(), dt.isoformat()
+        except Exception:
+            try:
+                dt = datetime.fromisoformat(text[:10]).replace(tzinfo=timezone.utc)
+                return dt.timestamp(), dt.isoformat()
+            except Exception:
+                continue
+    return 0.0, ""
+
+
+def fill_side(activity: Dict[str, Any]) -> str:
+    side = str(activity.get("side") or activity.get("order_side") or "").strip().lower()
+    if side in {"buy", "sell"}:
+        return side
+    net_amount = first_number_from_activity(activity)
+    # For normal long fills, buys are cash outflows and sells are cash inflows.
+    if net_amount is not None:
+        if net_amount < 0:
+            return "buy"
+        if net_amount > 0:
+            return "sell"
+    text = activity_text(activity)
+    if " buy" in f" {text} ":
+        return "buy"
+    if " sell" in f" {text} ":
+        return "sell"
+    return ""
+
+
+def fill_price(activity: Dict[str, Any]) -> Optional[float]:
+    for key in ("price", "avg_price", "filled_avg_price", "execution_price"):
+        value = to_optional_float(activity.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def fill_qty(activity: Dict[str, Any]) -> Optional[float]:
+    for key in ("qty", "quantity", "cum_qty", "filled_qty"):
+        value = to_optional_float(activity.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def trade_activity_dedupe_key(activity: Dict[str, Any]) -> str:
+    activity_id = str(activity.get("id") or "").strip()
+    if activity_id:
+        return f"id:{activity_id}"
+    ts, _ = parse_activity_time(activity)
+    symbol = clean_symbol(activity.get("symbol"))
+    qty = fill_qty(activity) or 0.0
+    price = fill_price(activity) or 0.0
+    side = fill_side(activity)
+    return f"sig:{ts:.0f}:{symbol}:{side}:{qty:.8f}:{price:.8f}"
+
+
+def trade_expectancy_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
+    """Approximate closed-trade expectancy from Alpaca FILL activities using FIFO lots.
+
+    This is intentionally read-only and conservative. It is best used as a directional
+    strategy-health metric, not as tax accounting.
+    """
+    raw_fills = get_account_activities_by_type(
+        session,
+        cfg,
+        "FILL",
+        after=cfg.trade_activity_after,
+        max_pages=cfg.trade_activity_max_pages,
+    )
+
+    seen: Set[str] = set()
+    fills: List[Dict[str, Any]] = []
+    duplicate_count = 0
+    ignored_count = 0
+
+    for activity in raw_fills:
+        if not isinstance(activity, dict):
+            ignored_count += 1
+            continue
+        key = trade_activity_dedupe_key(activity)
+        if key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(key)
+
+        symbol = clean_symbol(activity.get("symbol"))
+        side = fill_side(activity)
+        qty = fill_qty(activity)
+        price = fill_price(activity)
+        ts, iso = parse_activity_time(activity)
+        if not symbol or side not in {"buy", "sell"} or qty is None or price is None:
+            ignored_count += 1
+            continue
+        fills.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "timestamp": ts,
+                "time": iso,
+                "id": activity.get("id"),
+            }
+        )
+
+    fills.sort(key=lambda x: (to_float(x.get("timestamp"), 0.0), str(x.get("id") or "")))
+
+    lots_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    closed_trades: List[Dict[str, Any]] = []
+    buy_fill_count = 0
+    sell_fill_count = 0
+    unmatched_sell_qty = 0.0
+
+    for fill in fills:
+        symbol = str(fill["symbol"])
+        side = str(fill["side"])
+        qty = float(fill["qty"])
+        price = float(fill["price"])
+        lots = lots_by_symbol.setdefault(symbol, [])
+
+        if side == "buy":
+            buy_fill_count += 1
+            lots.append({"qty": qty, "price": price, "opened_at": fill.get("timestamp"), "opened_time": fill.get("time")})
+            continue
+
+        sell_fill_count += 1
+        remaining = qty
+        realized_pnl = 0.0
+        cost_basis = 0.0
+        matched_qty = 0.0
+        hold_seconds_weighted = 0.0
+
+        while remaining > 1e-9 and lots:
+            lot = lots[0]
+            lot_qty = float(lot.get("qty") or 0.0)
+            if lot_qty <= 1e-9:
+                lots.pop(0)
+                continue
+            matched = min(remaining, lot_qty)
+            buy_price = float(lot.get("price") or 0.0)
+            basis = matched * buy_price
+            pnl = matched * (price - buy_price)
+            realized_pnl += pnl
+            cost_basis += basis
+            matched_qty += matched
+            opened_at = to_float(lot.get("opened_at"), 0.0)
+            closed_at = to_float(fill.get("timestamp"), 0.0)
+            if opened_at > 0 and closed_at >= opened_at:
+                hold_seconds_weighted += (closed_at - opened_at) * matched
+            lot["qty"] = lot_qty - matched
+            remaining -= matched
+            if float(lot.get("qty") or 0.0) <= 1e-9:
+                lots.pop(0)
+
+        if remaining > 1e-9:
+            unmatched_sell_qty += remaining
+
+        if matched_qty > 1e-9:
+            realized_pct = realized_pnl / cost_basis if cost_basis > 0 else None
+            avg_hold_days = (hold_seconds_weighted / matched_qty / 86400.0) if matched_qty > 0 and hold_seconds_weighted > 0 else None
+            closed_trades.append(
+                {
+                    "symbol": symbol,
+                    "closed_at": fill.get("time"),
+                    "qty": matched_qty,
+                    "sell_price": price,
+                    "realized_pnl": realized_pnl,
+                    "realized_pct": realized_pct,
+                    "cost_basis": cost_basis,
+                    "avg_hold_days": avg_hold_days,
+                }
+            )
+
+    closed_count = len(closed_trades)
+    wins = [t for t in closed_trades if to_float(t.get("realized_pnl"), 0.0) > 0]
+    losses = [t for t in closed_trades if to_float(t.get("realized_pnl"), 0.0) < 0]
+    breakevens = closed_count - len(wins) - len(losses)
+    gross_profit = sum(to_float(t.get("realized_pnl"), 0.0) for t in wins)
+    gross_loss = abs(sum(to_float(t.get("realized_pnl"), 0.0) for t in losses))
+    total_realized_pnl = gross_profit - gross_loss
+    avg_win = gross_profit / len(wins) if wins else None
+    avg_loss = gross_loss / len(losses) if losses else None
+    win_rate = len(wins) / closed_count if closed_count else None
+    loss_rate = len(losses) / closed_count if closed_count else None
+    expectancy = total_realized_pnl / closed_count if closed_count else None
+    expectancy_pct = None
+    total_cost_basis = sum(to_float(t.get("cost_basis"), 0.0) for t in closed_trades)
+    if total_cost_basis > 0 and closed_count:
+        expectancy_pct = total_realized_pnl / total_cost_basis
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (None if gross_profit <= 0 else float("inf"))
+    payoff_ratio = (avg_win / avg_loss) if avg_win is not None and avg_loss and avg_loss > 0 else None
+    avg_hold_days_values = [to_float(t.get("avg_hold_days"), math.nan) for t in closed_trades]
+    avg_hold_days_values = [x for x in avg_hold_days_values if not math.isnan(x)]
+    avg_hold_days = sum(avg_hold_days_values) / len(avg_hold_days_values) if avg_hold_days_values else None
+    open_lots = sum(1 for lots in lots_by_symbol.values() for lot in lots if to_float(lot.get("qty"), 0.0) > 1e-9)
+    limit = max(0, cfg.trade_debug_limit)
+
+    return {
+        "source": "fifo_from_fill_activities",
+        "trade_activity_after": cfg.trade_activity_after,
+        "raw_fill_count": len(raw_fills),
+        "usable_fill_count": len(fills),
+        "duplicate_fill_count": duplicate_count,
+        "ignored_fill_count": ignored_count,
+        "buy_fill_count": buy_fill_count,
+        "sell_fill_count": sell_fill_count,
+        "closed_trade_count": closed_count,
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "breakeven_trades": breakevens,
+        "win_rate": win_rate,
+        "loss_rate": loss_rate,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "realized_pnl": total_realized_pnl,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "expectancy_pct_on_cost_basis": expectancy_pct,
+        "profit_factor": profit_factor,
+        "payoff_ratio": payoff_ratio,
+        "avg_hold_days": avg_hold_days,
+        "open_fifo_lots": open_lots,
+        "unmatched_sell_qty": unmatched_sell_qty,
+        "recent_closed_trades": closed_trades[-limit:] if limit else [],
+        "notes": "Expectancy is approximate FIFO matching from Alpaca FILL activities. It is a strategy-health estimate, not tax/accounting truth.",
+    }
+
+
+
 def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     started = time.time()
     set_state(last_refresh_started_at=now_iso(), last_error=None)
@@ -688,6 +946,11 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     positions_raw = get_positions(session, cfg)
     history = get_portfolio_history(session, cfg)
     cashflows = cash_flow_metrics(session, cfg)
+    try:
+        trades = trade_expectancy_metrics(session, cfg)
+    except Exception as exc:
+        log.warning("Could not calculate trade expectancy metrics: %s", exc)
+        trades = {"source": "error", "error": str(exc), "notes": "Trade expectancy metrics failed; account-level metrics are still available."}
 
     equity = to_float(account.get("equity") or account.get("portfolio_value"), 0.0)
     last_equity = to_optional_float(account.get("last_equity"))
@@ -717,6 +980,20 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     day_pnl = equity - last_equity if last_equity is not None else None
     day_return = pct(day_pnl, last_equity) if day_pnl is not None and last_equity else None
 
+    initial_margin = to_optional_float(account.get("initial_margin"))
+    maintenance_margin = to_optional_float(account.get("maintenance_margin"))
+    risk = {
+        "cash_pct_of_equity": pct(cash, equity) if cash is not None and equity else None,
+        "long_exposure_pct_of_equity": pct(long_market_value, equity) if long_market_value is not None and equity else None,
+        "initial_margin_pct_of_equity": pct(initial_margin, equity) if initial_margin is not None and equity else None,
+        "maintenance_margin_pct_of_equity": pct(maintenance_margin, equity) if maintenance_margin is not None and equity else None,
+        "daytrade_count": account.get("daytrade_count"),
+        "pattern_day_trader": account.get("pattern_day_trader"),
+        "trading_blocked": account.get("trading_blocked"),
+        "transfers_blocked": account.get("transfers_blocked"),
+        "account_blocked": account.get("account_blocked"),
+    }
+
     metrics: Dict[str, Any] = {
         "generated_at": now_iso(),
         "runtime_seconds": round(time.time() - started, 3),
@@ -734,8 +1011,8 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
             "portfolio_value": portfolio_value,
             "long_market_value": long_market_value,
             "short_market_value": short_market_value,
-            "initial_margin": to_optional_float(account.get("initial_margin")),
-            "maintenance_margin": to_optional_float(account.get("maintenance_margin")),
+            "initial_margin": initial_margin,
+            "maintenance_margin": maintenance_margin,
             "daytrade_count": account.get("daytrade_count"),
             "pattern_day_trader": account.get("pattern_day_trader"),
             "trading_blocked": account.get("trading_blocked"),
@@ -757,12 +1034,14 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
         },
         "positions": positions,
         "history": hist,
+        "trades": trades,
+        "risk": risk,
     }
 
     largest_loser = positions.get("largest_loser") or {}
     largest_winner = positions.get("largest_winner") or {}
     log.info(
-        "Metrics refreshed mode=%s equity=%.2f deposits=%.2f withdrawals=%.2f net_funding=%.2f lifetime_pnl=%s return_on_deposits=%s positions=%d red=%d green=%d day_pnl=%s largest_loser=%s:%s largest_winner=%s:%s",
+        "Metrics refreshed mode=%s equity=%.2f deposits=%.2f withdrawals=%.2f net_funding=%.2f lifetime_pnl=%s return_on_deposits=%s expectancy=%s win_rate=%s closed_trades=%s positions=%d red=%d green=%d day_pnl=%s largest_loser=%s:%s largest_winner=%s:%s",
         metrics["mode"],
         equity,
         total_deposits,
@@ -770,6 +1049,9 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
         net_deposits,
         fmt_money(lifetime_pnl),
         fmt_pct(return_on_total_deposits),
+        fmt_money(trades.get("expectancy")) if isinstance(trades, dict) else "—",
+        fmt_pct(trades.get("win_rate")) if isinstance(trades, dict) else "—",
+        trades.get("closed_trade_count") if isinstance(trades, dict) else "—",
         positions["positions_count"],
         positions["red_positions"],
         positions["green_positions"],
@@ -834,14 +1116,214 @@ def metrics_loop(cfg: Config) -> None:
 # -----------------------------
 
 
-def metric_card(title: str, value: str, sub: str = "") -> str:
+def iso_to_epoch(text: Any) -> Optional[float]:
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def fmt_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "—"
+    try:
+        seconds = max(0.0, float(seconds))
+    except Exception:
+        return "—"
+    if seconds < 1:
+        return f"{seconds * 1000:.0f} ms"
+    if seconds < 60:
+        return f"{seconds:.1f} sec"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.1f} min"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{hours:.1f} hr"
+    return f"{hours / 24:.1f} days"
+
+
+def duration_since_iso(text: Any) -> Optional[float]:
+    ts = iso_to_epoch(text)
+    if ts is None:
+        return None
+    return max(0.0, time.time() - ts)
+
+
+def fmt_short_date(text: Any) -> str:
+    if not text:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+        return dt.strftime("%b %-d")
+    except Exception:
+        return str(text)[:10]
+
+
+def finite_number(value: Any) -> Optional[float]:
+    value = to_optional_float(value)
+    if value is None or math.isnan(value) or math.isinf(value):
+        return None
+    return value
+
+
+def metric_card(title: str, value: str, sub: str = "", help_text: str = "") -> str:
+    help_attr = f' data-help="{safe_text(help_text)}"' if help_text else ""
     return f"""
-    <div class="card">
+    <div class="card"{help_attr}>
       <div class="card-title">{safe_text(title)}</div>
       <div class="card-value">{safe_text(value)}</div>
       <div class="card-sub">{safe_text(sub)}</div>
     </div>
     """
+
+
+def line_chart(title: str, points: Sequence[Tuple[Any, Any]], *, value_kind: str = "money", help_text: str = "") -> str:
+    clean: List[Tuple[str, float]] = []
+    for label, value in points:
+        num = finite_number(value)
+        if num is None:
+            continue
+        clean.append((fmt_short_date(label), num))
+
+    if len(clean) < 2:
+        return f"""
+        <div class="chart-card" data-help="{safe_text(help_text)}">
+          <div class="chart-title">{safe_text(title)}</div>
+          <div class="empty-chart">Not enough history yet.</div>
+        </div>
+        """
+
+    width, height = 720, 240
+    pad_left, pad_right, pad_top, pad_bottom = 64, 18, 24, 42
+    plot_w = width - pad_left - pad_right
+    plot_h = height - pad_top - pad_bottom
+    values = [v for _, v in clean]
+    min_v = min(values)
+    max_v = max(values)
+    if abs(max_v - min_v) < 1e-9:
+        max_v += 1
+        min_v -= 1
+    # Add a tiny vertical buffer so the line does not sit on the border.
+    span = max_v - min_v
+    min_v -= span * 0.08
+    max_v += span * 0.08
+    span = max_v - min_v
+
+    coords = []
+    n = len(clean)
+    for idx, (_, value) in enumerate(clean):
+        x = pad_left + (idx / max(1, n - 1)) * plot_w
+        y = pad_top + (max_v - value) / span * plot_h
+        coords.append((x, y))
+    path = " ".join(("M" if idx == 0 else "L") + f" {x:.2f} {y:.2f}" for idx, (x, y) in enumerate(coords))
+
+    def fmt_axis(v: float) -> str:
+        if value_kind == "percent":
+            return fmt_pct(v)
+        return fmt_money(v)
+
+    y_max = safe_text(fmt_axis(max(values)))
+    y_min = safe_text(fmt_axis(min(values)))
+    first_label = safe_text(clean[0][0])
+    last_label = safe_text(clean[-1][0])
+    dot_markup = []
+    step = max(1, len(coords) // 12)
+    for idx, ((x, y), (label, value)) in enumerate(zip(coords, clean)):
+        if idx % step != 0 and idx not in {len(coords) - 1}:
+            continue
+        dot_label = f"{label}: {fmt_axis(value)}"
+        dot_markup.append(f'<circle class="chart-dot" cx="{x:.2f}" cy="{y:.2f}" r="3"><title>{safe_text(dot_label)}</title></circle>')
+
+    return f"""
+    <div class="chart-card" data-help="{safe_text(help_text)}">
+      <div class="chart-title">{safe_text(title)}</div>
+      <svg class="chart" viewBox="0 0 {width} {height}" role="img" aria-label="{safe_text(title)}">
+        <line class="axis" x1="{pad_left}" y1="{pad_top}" x2="{pad_left}" y2="{height - pad_bottom}" />
+        <line class="axis" x1="{pad_left}" y1="{height - pad_bottom}" x2="{width - pad_right}" y2="{height - pad_bottom}" />
+        <line class="gridline" x1="{pad_left}" y1="{pad_top}" x2="{width - pad_right}" y2="{pad_top}" />
+        <text class="axis-label" x="8" y="{pad_top + 5}">{y_max}</text>
+        <text class="axis-label" x="8" y="{height - pad_bottom}">{y_min}</text>
+        <text class="axis-label" x="{pad_left}" y="{height - 12}">{first_label}</text>
+        <text class="axis-label" x="{width - 82}" y="{height - 12}">{last_label}</text>
+        <path class="line-path" d="{path}" />
+        {''.join(dot_markup)}
+      </svg>
+    </div>
+    """
+
+
+def bar_chart(title: str, rows: Sequence[Dict[str, Any]], *, help_text: str = "") -> str:
+    clean: List[Tuple[str, float]] = []
+    for row in rows:
+        value = finite_number(row.get("realized_pnl"))
+        if value is None:
+            continue
+        label = f"{row.get('symbol', '')} {fmt_short_date(row.get('closed_at'))}".strip()
+        clean.append((label or "trade", value))
+    clean = clean[-20:]
+
+    if not clean:
+        return f"""
+        <div class="chart-card" data-help="{safe_text(help_text)}">
+          <div class="chart-title">{safe_text(title)}</div>
+          <div class="empty-chart">No closed trades found yet.</div>
+        </div>
+        """
+
+    width, height = 720, 260
+    pad_left, pad_right, pad_top, pad_bottom = 44, 18, 24, 54
+    plot_w = width - pad_left - pad_right
+    plot_h = height - pad_top - pad_bottom
+    values = [v for _, v in clean]
+    max_abs = max(abs(v) for v in values) or 1.0
+    zero_y = pad_top + plot_h / 2
+    bar_w = max(8, plot_w / len(clean) * 0.62)
+    bars = []
+    for idx, (label, value) in enumerate(clean):
+        x = pad_left + (idx + 0.5) * plot_w / len(clean) - bar_w / 2
+        bar_h = abs(value) / max_abs * (plot_h / 2 - 8)
+        if value >= 0:
+            y = zero_y - bar_h
+            cls = "bar-pos"
+        else:
+            y = zero_y
+            cls = "bar-neg"
+        bars.append(f'<rect class="{cls}" x="{x:.2f}" y="{y:.2f}" width="{bar_w:.2f}" height="{bar_h:.2f}" rx="4"><title>{safe_text(label)}: {safe_text(fmt_money(value))}</title></rect>')
+
+    return f"""
+    <div class="chart-card" data-help="{safe_text(help_text)}">
+      <div class="chart-title">{safe_text(title)}</div>
+      <svg class="chart" viewBox="0 0 {width} {height}" role="img" aria-label="{safe_text(title)}">
+        <line class="axis" x1="{pad_left}" y1="{zero_y:.2f}" x2="{width - pad_right}" y2="{zero_y:.2f}" />
+        <text class="axis-label" x="8" y="{pad_top + 8}">{safe_text(fmt_money(max_abs))}</text>
+        <text class="axis-label" x="8" y="{height - pad_bottom + 4}">-{safe_text(fmt_money(max_abs))[1:] if fmt_money(max_abs).startswith('$') else safe_text(fmt_money(max_abs))}</text>
+        {''.join(bars)}
+        <text class="axis-label" x="{pad_left}" y="{height - 16}">Oldest</text>
+        <text class="axis-label" x="{width - 72}" y="{height - 16}">Newest</text>
+      </svg>
+    </div>
+    """
+
+
+def compact_status_flags(account: Dict[str, Any], risk: Dict[str, Any]) -> str:
+    flags = []
+    if risk.get("pattern_day_trader") is True:
+        flags.append("PDT")
+    if risk.get("trading_blocked") is True:
+        flags.append("Trading blocked")
+    if risk.get("transfers_blocked") is True:
+        flags.append("Transfers blocked")
+    if risk.get("account_blocked") is True:
+        flags.append("Account blocked")
+    if not flags:
+        return "OK"
+    return ", ".join(flags)
 
 
 def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config) -> str:
@@ -850,35 +1332,65 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
     cash_flows = metrics.get("cash_flows", {})
     positions = metrics.get("positions", {})
     history = metrics.get("history", {})
+    trades = metrics.get("trades", {})
+    risk = metrics.get("risk", {})
 
     largest_loser = positions.get("largest_loser") or {}
     largest_winner = positions.get("largest_winner") or {}
+    uptime = duration_since_iso(state.get("started_at"))
 
     warning = ""
     if not cfg.dashboard_token:
         warning = "<div class='warning'>DASHBOARD_TOKEN is not set. This Railway web dashboard is unprotected.</div>"
     if cash_flows.get("source", "").startswith("account_activities") and to_float(cash_flows.get("deposits"), 0.0) <= 0:
         warning += "<div class='warning'>No deposit activity was found. Check CASH_FLOW_ACTIVITY_TYPES / ACTIVITY_AFTER, or set NET_DEPOSITS_OVERRIDE if the funding number looks wrong.</div>"
+    if trades.get("source") == "error":
+        warning += f"<div class='warning'>Trade expectancy could not be calculated: {safe_text(trades.get('error'))}</div>"
+    elif trades.get("closed_trade_count", 0) == 0:
+        warning += "<div class='warning'>No closed trades were found from FILL activities yet, so expectancy metrics are blank. Check TRADE_ACTIVITY_AFTER if this looks wrong.</div>"
+
+    exposure_sub = f"Cash: {fmt_pct(risk.get('cash_pct_of_equity'))} · Long: {fmt_pct(risk.get('long_exposure_pct_of_equity'))}"
+    margin_sub = f"Initial: {fmt_pct(risk.get('initial_margin_pct_of_equity'))} · Maint: {fmt_pct(risk.get('maintenance_margin_pct_of_equity'))}"
+    account_flags = compact_status_flags(account, risk)
 
     cards = "\n".join(
         [
-            metric_card("Equity", fmt_money(account.get("equity")), f"Mode: {metrics.get('mode', 'unknown')}"),
-            metric_card("Lifetime P/L", fmt_money(profitability.get("lifetime_pnl")), "Equity + withdrawals - deposits"),
-            metric_card("Return on deposits", fmt_pct(profitability.get("return_on_total_deposits")), "Lifetime P/L / total deposits"),
-            metric_card("Net funding", fmt_money(profitability.get("net_funding")), f"Source: {cash_flows.get('source')}"),
-            metric_card("Total deposits", fmt_money(profitability.get("total_deposits")), f"Since {cash_flows.get('activity_after', 'start')}"),
-            metric_card("Total withdrawals", fmt_money(profitability.get("total_withdrawals")), f"Cash-flow events: {cash_flows.get('activity_count', 0)}"),
-            metric_card("Day P/L", fmt_money(account.get("day_pnl")), fmt_pct(account.get("day_return"))),
-            metric_card("Buying power", fmt_money(account.get("buying_power")), f"Reg-T: {fmt_money(account.get('regt_buying_power'))}"),
-            metric_card("Open unrealized P/L", fmt_money(profitability.get("unrealized_pl_open_positions")), f"Positions: {positions.get('positions_count', 0)}"),
-            metric_card("Red / Green", f"{positions.get('red_positions', 0)} / {positions.get('green_positions', 0)}", "Open positions"),
-            metric_card("Current drawdown", fmt_pct(history.get("current_drawdown")), f"Max: {fmt_pct(history.get('max_drawdown'))}"),
-            metric_card("Largest loser / winner", f"{safe_text(largest_loser.get('symbol') or '—')} / {safe_text(largest_winner.get('symbol') or '—')}", f"{fmt_pct(largest_loser.get('unrealized_plpc')) if largest_loser else '—'} / {fmt_pct(largest_winner.get('unrealized_plpc')) if largest_winner else '—'}"),
+            metric_card("Equity", fmt_money(account.get("equity")), f"Mode: {metrics.get('mode', 'unknown')}", "Current Alpaca account equity / portfolio value."),
+            metric_card("Lifetime P/L", fmt_money(profitability.get("lifetime_pnl")), "Equity + withdrawals - deposits", "Cash-flow-adjusted profit/loss. This answers whether the account is above or below all money put in, after withdrawals."),
+            metric_card("Return on deposits", fmt_pct(profitability.get("return_on_total_deposits")), "Lifetime P/L / total deposits", "Return measured against all deposits ever put into the account. Better for accounts that were drawn down and refilled."),
+            metric_card("Expectancy / trade", fmt_money(trades.get("expectancy")), f"Closed trades: {trades.get('closed_trade_count', 0)}", "Approximate average realized P/L per closed sell event, FIFO-matched from Alpaca FILL activities."),
+            metric_card("Win rate", fmt_pct(trades.get("win_rate")), f"Wins/Losses: {trades.get('winning_trades', 0)} / {trades.get('losing_trades', 0)}", "Share of closed trades with positive realized P/L. A high win rate can still lose money if losses are much larger than wins."),
+            metric_card("Profit factor", fmt_num(trades.get("profit_factor"), 2), f"Gross profit / gross loss", "Above 1 means closed winners are larger than closed losers in aggregate. Blank means there are no losses yet or not enough data."),
+            metric_card("Realized P/L", fmt_money(trades.get("realized_pnl")), f"Since {trades.get('trade_activity_after', 'start')}", "Approximate realized P/L reconstructed from fill activities. This is not tax accounting."),
+            metric_card("Avg winner / loser", f"{fmt_money(trades.get('avg_win'))} / {fmt_money(trades.get('avg_loss'))}", f"Avg hold: {fmt_num(trades.get('avg_hold_days'), 1)} days", "Average winner and average absolute loser from closed trades. Compare this with win rate to judge strategy quality."),
+            metric_card("Net funding", fmt_money(profitability.get("net_funding")), f"Source: {cash_flows.get('source')}", "Deposits minus withdrawals from deduped Alpaca cash-flow activities, or NET_DEPOSITS_OVERRIDE if set."),
+            metric_card("Total deposits", fmt_money(profitability.get("total_deposits")), f"Since {cash_flows.get('activity_after', 'start')}", "Total external cash found entering the account."),
+            metric_card("Total withdrawals", fmt_money(profitability.get("total_withdrawals")), f"Cash-flow events: {cash_flows.get('activity_count', 0)}", "Total external cash found leaving the account."),
+            metric_card("Day P/L", fmt_money(account.get("day_pnl")), fmt_pct(account.get("day_return")), "Current equity minus Alpaca last_equity. Useful for today's move, but not enough to prove strategy edge."),
+            metric_card("Drawdown", fmt_pct(history.get("current_drawdown")), f"Max: {fmt_pct(history.get('max_drawdown'))}", "Current and worst drop from the recent equity high-water mark in the portfolio-history window."),
+            metric_card("Exposure", fmt_pct(risk.get("long_exposure_pct_of_equity")), exposure_sub, "Long market value divided by equity. Shows how invested the account is without listing top positions."),
+            metric_card("Margin use", fmt_pct(risk.get("initial_margin_pct_of_equity")), margin_sub, "Initial and maintenance margin divided by equity. Higher values mean less room for volatility."),
+            metric_card("Buying power", fmt_money(account.get("buying_power")), f"Reg-T: {fmt_money(account.get('regt_buying_power'))}", "Alpaca buying power and Reg-T buying power."),
+            metric_card("Open unrealized P/L", fmt_money(profitability.get("unrealized_pl_open_positions")), f"Positions: {positions.get('positions_count', 0)}", "Open-position P/L that has not been realized through sells yet."),
+            metric_card("Red / Green", f"{positions.get('red_positions', 0)} / {positions.get('green_positions', 0)}", "Open positions", "Count of open positions with negative versus positive unrealized P/L."),
+            metric_card("Largest loser / winner", f"{safe_text(largest_loser.get('symbol') or '—')} / {safe_text(largest_winner.get('symbol') or '—')}", f"{fmt_pct(largest_loser.get('unrealized_plpc')) if largest_loser else '—'} / {fmt_pct(largest_winner.get('unrealized_plpc')) if largest_winner else '—'}", "Single worst and best open position by unrealized percentage. Kept as a quick warning signal, not a full positions table."),
+            metric_card("Refresh runtime", fmt_duration(metrics.get("runtime_seconds")), f"Refresh count: {state.get('refresh_count', 0)}", "How long the last metrics refresh took. If this grows, the bot may be pulling too much activity history."),
+            metric_card("Bot uptime", fmt_duration(uptime), f"Last refresh: {safe_text(state.get('last_refresh_finished_at') or '—')}", "How long the Railway service has been running since the last restart/deploy."),
+            metric_card("Account flags", account_flags, f"Day trades: {risk.get('daytrade_count')}", "Shows PDT/trading/transfer/account block flags returned by Alpaca."),
+        ]
+    )
+
+    charts = "\n".join(
+        [
+            line_chart("Equity trend", history.get("equity_series") or [], value_kind="money", help_text="Recent account equity from Alpaca portfolio history."),
+            line_chart("Drawdown trend", history.get("drawdown_series") or [], value_kind="percent", help_text="Drop from the recent equity high-water mark. Lower means deeper drawdown."),
+            bar_chart("Recent closed-trade P/L", trades.get("recent_closed_trades") or [], help_text="Approximate realized P/L for the most recent closed trades, FIFO-matched from FILL activities."),
         ]
     )
 
     json_url = "/api/metrics"
     refresh_url = "/refresh"
+    trades_url = "/api/trades"
     token_note = ""
     if cfg.dashboard_token:
         token_note = "Token auth is enabled. Use ?token=... or X-Dashboard-Token for JSON/refresh endpoints."
@@ -892,27 +1404,34 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
       <meta http-equiv="refresh" content="{int(max(10, cfg.web_refresh_seconds))}" />
       <title>Alpaca Metrics Bot</title>
       <style>
-        :root {{ color-scheme: dark; }}
-        body {{ margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: #101114; color: #eeeeee; }}
+        :root {{ color-scheme: dark; --bg: #101114; --panel: #181a20; --border: #2b2e37; --muted: #a7a7a7; --text: #eeeeee; --accent: #9cc2ff; --good: #7ddc91; --bad: #ff8a8a; }}
+        body {{ margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }}
         header {{ padding: 28px 28px 8px; }}
         h1 {{ margin: 0 0 6px; font-size: 28px; }}
-        h2 {{ margin-top: 34px; }}
-        .muted {{ color: #a7a7a7; font-size: 14px; }}
+        h2 {{ margin: 26px 28px 8px; font-size: 20px; }}
+        .muted {{ color: var(--muted); font-size: 14px; }}
         .warning {{ margin: 16px 28px; padding: 12px 14px; border: 1px solid #7c5b00; background: #2a2107; color: #ffd782; border-radius: 12px; }}
         .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; padding: 20px 28px; }}
-        .card {{ background: #181a20; border: 1px solid #2b2e37; border-radius: 14px; padding: 16px; }}
-        .card-title {{ color: #a7a7a7; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }}
+        .charts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; padding: 20px 28px; }}
+        .card, .chart-card {{ position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }}
+        .card[data-help]::after, .chart-card[data-help]::after {{ content: attr(data-help); position: absolute; left: 14px; right: 14px; bottom: calc(100% + 8px); background: #07080a; border: 1px solid #3a3e49; color: var(--text); padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.35; opacity: 0; transform: translateY(4px); transition: opacity .12s ease, transform .12s ease; pointer-events: none; z-index: 10; box-shadow: 0 10px 28px rgba(0,0,0,.35); }}
+        .card[data-help]:hover::after, .chart-card[data-help]:hover::after {{ opacity: 1; transform: translateY(0); }}
+        .card-title {{ color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }}
         .card-value {{ margin-top: 8px; font-size: 24px; font-weight: 700; }}
-        .card-sub {{ margin-top: 4px; color: #a7a7a7; font-size: 13px; }}
+        .card-sub {{ margin-top: 4px; color: var(--muted); font-size: 13px; }}
+        .chart-title {{ color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 8px; }}
+        .chart {{ width: 100%; height: auto; display: block; }}
+        .axis {{ stroke: #454a55; stroke-width: 1; }}
+        .gridline {{ stroke: #2b2e37; stroke-width: 1; }}
+        .axis-label {{ fill: var(--muted); font-size: 12px; }}
+        .line-path {{ fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }}
+        .chart-dot {{ fill: var(--accent); }}
+        .bar-pos {{ fill: var(--good); opacity: .86; }}
+        .bar-neg {{ fill: var(--bad); opacity: .86; }}
+        .empty-chart {{ min-height: 180px; display: grid; place-items: center; color: var(--muted); border: 1px dashed var(--border); border-radius: 12px; }}
         main {{ padding: 0 28px 40px; }}
-        table {{ width: 100%; border-collapse: collapse; background: #181a20; border: 1px solid #2b2e37; border-radius: 14px; overflow: hidden; }}
-        th, td {{ padding: 10px 12px; border-bottom: 1px solid #2b2e37; text-align: left; }}
-        th {{ color: #a7a7a7; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
-        td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-        .neg {{ color: #ff8a8a; }}
-        .pos {{ color: #7ddc91; }}
-        .footer {{ margin-top: 28px; color: #a7a7a7; font-size: 13px; }}
-        a {{ color: #9cc2ff; }}
+        .footer {{ margin-top: 28px; color: var(--muted); font-size: 13px; }}
+        a {{ color: var(--accent); }}
       </style>
     </head>
     <body>
@@ -921,15 +1440,19 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
         <div class="muted">Version: {safe_text(metrics.get('app_version'))}. Generated at {safe_text(metrics.get('generated_at'))}. Last refresh finished {safe_text(state.get('last_refresh_finished_at'))}. Auto-refreshes every {int(max(10, cfg.web_refresh_seconds))} seconds.</div>
       </header>
       {warning}
+      <h2>Scoreboard</h2>
       <section class="grid">{cards}</section>
+      <h2>Visuals</h2>
+      <section class="charts">{charts}</section>
       <main>
         <div class="footer">
-          <p>JSON: <a href="{json_url}">{json_url}</a> · Force refresh: <a href="{refresh_url}">{refresh_url}</a></p>
+          <p>JSON: <a href="{json_url}">{json_url}</a> · Trades: <a href="{trades_url}">{trades_url}</a> · Force refresh: <a href="{refresh_url}">{refresh_url}</a></p>
           <p>{safe_text(token_note)}</p>
           <p>Lifetime P/L uses: current equity + total withdrawals - total deposits. The funding calculation is deduped and excludes fills, dividends, interest, fees, and market P/L.</p>
+          <p>Expectancy is approximate FIFO matching from Alpaca FILL activities since {safe_text(trades.get('trade_activity_after', 'start'))}. It is meant for strategy health, not tax accounting.</p>
           <p>Cash-flow activity types checked: {safe_text(','.join(cash_flows.get('activity_types_checked') or []))}. Raw activities: {safe_text(cash_flows.get('raw_activity_count'))}; duplicates skipped: {safe_text(cash_flows.get('duplicate_activity_count'))}; ignored: {safe_text(cash_flows.get('ignored_activity_count'))}.</p>
-          <p>Set NET_DEPOSITS_OVERRIDE only if Alpaca activities still do not match your actual funding history.</p>
-          <p>Version: {safe_text(metrics.get('app_version'))}. If you still see Top exposure or Worst positions first, Railway is still serving the older deployment.</p>
+          <p>Set NET_DEPOSITS_OVERRIDE only if Alpaca activities still do not match your actual funding history. Use TRADE_ACTIVITY_AFTER if expectancy pulls too much old fill history.</p>
+          <p>Version: {safe_text(metrics.get('app_version'))}.</p>
         </div>
       </main>
     </body>
@@ -1003,6 +1526,14 @@ def api_cashflows(request: Request) -> JSONResponse:
     require_dashboard_token(request, config)
     metrics = get_cached_or_refresh(config)
     return JSONResponse(metrics.get("cash_flows", {}))
+
+
+@app.get("/api/trades")
+def api_trades(request: Request) -> JSONResponse:
+    config = cfg()
+    require_dashboard_token(request, config)
+    metrics = get_cached_or_refresh(config)
+    return JSONResponse(metrics.get("trades", {}))
 
 
 @app.get("/refresh")
