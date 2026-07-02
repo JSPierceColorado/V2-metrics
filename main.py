@@ -6,12 +6,12 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import requests
 
-APP_VERSION = "metrics-bot-v4-tooltips-charts-expectancy-2026-07-02"
+APP_VERSION = "metrics-bot-v6-clean-dashboard-2026-07-02"
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -872,6 +872,7 @@ def trade_expectancy_metrics(session: requests.Session, cfg: Config) -> Dict[str
                 {
                     "symbol": symbol,
                     "closed_at": fill.get("time"),
+                    "closed_timestamp": fill.get("timestamp"),
                     "qty": matched_qty,
                     "sell_price": price,
                     "realized_pnl": realized_pnl,
@@ -932,10 +933,174 @@ def trade_expectancy_metrics(session: requests.Session, cfg: Config) -> Dict[str
         "avg_hold_days": avg_hold_days,
         "open_fifo_lots": open_lots,
         "unmatched_sell_qty": unmatched_sell_qty,
+        "first_closed_trade_at": closed_trades[0].get("closed_at") if closed_trades else None,
+        "last_closed_trade_at": closed_trades[-1].get("closed_at") if closed_trades else None,
         "recent_closed_trades": closed_trades[-limit:] if limit else [],
         "notes": "Expectancy is approximate FIFO matching from Alpaca FILL activities. It is a strategy-health estimate, not tax/accounting truth.",
     }
 
+
+
+def epoch_from_isoish(value: Any) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(str(value)[:10]).replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return None
+
+
+def days_between(start: Any, end: Any) -> Optional[float]:
+    start_ts = epoch_from_isoish(start)
+    end_ts = epoch_from_isoish(end)
+    if start_ts is None or end_ts is None:
+        return None
+    days = (end_ts - start_ts) / 86400.0
+    return days if days > 0 else None
+
+
+def projection_point(label_days: int, equity: float, pnl_per_day: Optional[float]) -> Dict[str, Any]:
+    when = datetime.now(timezone.utc) + timedelta(days=label_days)
+    projected_pnl = pnl_per_day * label_days if pnl_per_day is not None else None
+    return {
+        "date": when.isoformat(),
+        "days": label_days,
+        "projected_pnl": projected_pnl,
+        "projected_equity": equity + projected_pnl if projected_pnl is not None else None,
+    }
+
+
+def projection_metrics(
+    *,
+    equity: float,
+    lifetime_pnl: Optional[float],
+    cashflows: Dict[str, Any],
+    history: Dict[str, Any],
+    trades: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Derived forward-looking run-rate estimates.
+
+    These are not predictions. They simply answer: "If the recent/account/trade run-rate kept going,
+    what would that imply?" The output is intentionally explicit about the basis used.
+    """
+    now_text = now_iso()
+
+    equity_series = history.get("equity_series") or []
+    history_pnl_per_day: Optional[float] = None
+    history_days: Optional[float] = None
+    history_annualized_return: Optional[float] = None
+    if isinstance(equity_series, list) and len(equity_series) >= 2:
+        first_ts, first_eq = equity_series[0]
+        last_ts, last_eq = equity_series[-1]
+        first_eq_f = to_float(first_eq, 0.0)
+        last_eq_f = to_float(last_eq, 0.0)
+        history_days = days_between(first_ts, last_ts)
+        if history_days and first_eq_f > 0 and last_eq_f > 0:
+            history_pnl_per_day = (last_eq_f - first_eq_f) / history_days
+            # Annualized recent equity trend. This can be distorted by deposits/withdrawals inside the window.
+            try:
+                history_annualized_return = (last_eq_f / first_eq_f) ** (365.0 / history_days) - 1.0
+            except Exception:
+                history_annualized_return = None
+
+    first_cash_flow_date = cashflows.get("first_cash_flow_date")
+    funding_days = days_between(first_cash_flow_date, now_text) if first_cash_flow_date else None
+    lifetime_pnl_per_day: Optional[float] = None
+    if funding_days and lifetime_pnl is not None:
+        lifetime_pnl_per_day = lifetime_pnl / funding_days
+
+    expectancy = to_optional_float(trades.get("expectancy")) if isinstance(trades, dict) else None
+    avg_win = to_optional_float(trades.get("avg_win")) if isinstance(trades, dict) else None
+    avg_loss = to_optional_float(trades.get("avg_loss")) if isinstance(trades, dict) else None
+    win_rate = to_optional_float(trades.get("win_rate")) if isinstance(trades, dict) else None
+    closed_count = int(to_float(trades.get("closed_trade_count"), 0.0)) if isinstance(trades, dict) else 0
+    trade_days = days_between(trades.get("first_closed_trade_at"), trades.get("last_closed_trade_at")) if isinstance(trades, dict) else None
+    closed_trades_per_day: Optional[float] = None
+    trade_pnl_per_day: Optional[float] = None
+    if trade_days and closed_count > 1:
+        # Floor at one day so a burst of same-day closes does not create absurd projections.
+        closed_trades_per_day = closed_count / max(1.0, trade_days)
+        if expectancy is not None:
+            trade_pnl_per_day = expectancy * closed_trades_per_day
+
+    breakeven_win_rate: Optional[float] = None
+    edge_gap: Optional[float] = None
+    if avg_win is not None and avg_win > 0 and avg_loss is not None and avg_loss > 0:
+        breakeven_win_rate = avg_loss / (avg_win + avg_loss)
+        if win_rate is not None:
+            edge_gap = win_rate - breakeven_win_rate
+
+    # Pick a headline projection basis. Prefer trade expectancy when there are enough closed trades;
+    # otherwise use recent equity trend; otherwise use lifetime P/L run-rate.
+    basis = "unavailable"
+    headline_pnl_per_day: Optional[float] = None
+    if trade_pnl_per_day is not None and closed_count >= 5:
+        basis = "trade_expectancy_run_rate"
+        headline_pnl_per_day = trade_pnl_per_day
+    elif history_pnl_per_day is not None and history_days is not None and history_days >= 5:
+        basis = "recent_equity_trend"
+        headline_pnl_per_day = history_pnl_per_day
+    elif lifetime_pnl_per_day is not None and funding_days is not None and funding_days >= 7:
+        basis = "lifetime_cash_flow_adjusted_run_rate"
+        headline_pnl_per_day = lifetime_pnl_per_day
+
+    high_water_mark = to_optional_float(history.get("high_water_mark"))
+    recovery_needed: Optional[float] = None
+    recovery_return_needed: Optional[float] = None
+    days_to_recover: Optional[float] = None
+    if high_water_mark is not None and equity > 0 and high_water_mark > equity:
+        recovery_needed = high_water_mark - equity
+        recovery_return_needed = high_water_mark / equity - 1.0
+        if headline_pnl_per_day is not None and headline_pnl_per_day > 0:
+            days_to_recover = recovery_needed / headline_pnl_per_day
+
+    projected_series = [projection_point(0, equity, headline_pnl_per_day)]
+    # Use now for the starting point rather than adding zero days in the future.
+    projected_series[0]["date"] = now_text
+    projected_series[0]["projected_pnl"] = 0.0
+    projected_series[0]["projected_equity"] = equity
+    projected_series.extend(projection_point(d, equity, headline_pnl_per_day) for d in (30, 60, 90, 180, 365))
+
+    def projected_return(days: int) -> Optional[float]:
+        if headline_pnl_per_day is None or equity <= 0:
+            return None
+        return (headline_pnl_per_day * days) / equity
+
+    return {
+        "basis": basis,
+        "headline_pnl_per_day": headline_pnl_per_day,
+        "projected_30d_pnl": headline_pnl_per_day * 30 if headline_pnl_per_day is not None else None,
+        "projected_90d_pnl": headline_pnl_per_day * 90 if headline_pnl_per_day is not None else None,
+        "projected_365d_pnl": headline_pnl_per_day * 365 if headline_pnl_per_day is not None else None,
+        "projected_30d_return": projected_return(30),
+        "projected_90d_return": projected_return(90),
+        "projected_365d_return": projected_return(365),
+        "projected_equity_series": projected_series,
+        "history_pnl_per_day": history_pnl_per_day,
+        "history_days": history_days,
+        "history_annualized_return": history_annualized_return,
+        "lifetime_pnl_per_day": lifetime_pnl_per_day,
+        "funding_days": funding_days,
+        "trade_pnl_per_day": trade_pnl_per_day,
+        "trade_days": trade_days,
+        "closed_trades_per_day": closed_trades_per_day,
+        "closed_trades_per_week": closed_trades_per_day * 7 if closed_trades_per_day is not None else None,
+        "projected_closed_trades_30d": closed_trades_per_day * 30 if closed_trades_per_day is not None else None,
+        "breakeven_win_rate": breakeven_win_rate,
+        "edge_gap": edge_gap,
+        "recovery_needed": recovery_needed,
+        "recovery_return_needed": recovery_return_needed,
+        "days_to_recover_high_water": days_to_recover,
+        "notes": "Projections are run-rate estimates from existing data, not forecasts or guarantees. Cash flows can distort recent equity trend projections.",
+    }
 
 
 def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
@@ -994,7 +1159,16 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
         "account_blocked": account.get("account_blocked"),
     }
 
+    projection = projection_metrics(
+        equity=equity,
+        lifetime_pnl=lifetime_pnl,
+        cashflows=cashflows,
+        history=hist,
+        trades=trades if isinstance(trades, dict) else {},
+    )
+
     metrics: Dict[str, Any] = {
+        "app_version": APP_VERSION,
         "generated_at": now_iso(),
         "runtime_seconds": round(time.time() - started, 3),
         "mode": "paper" if cfg.alpaca_paper else "live",
@@ -1036,12 +1210,13 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
         "history": hist,
         "trades": trades,
         "risk": risk,
+        "projection": projection,
     }
 
     largest_loser = positions.get("largest_loser") or {}
     largest_winner = positions.get("largest_winner") or {}
     log.info(
-        "Metrics refreshed mode=%s equity=%.2f deposits=%.2f withdrawals=%.2f net_funding=%.2f lifetime_pnl=%s return_on_deposits=%s expectancy=%s win_rate=%s closed_trades=%s positions=%d red=%d green=%d day_pnl=%s largest_loser=%s:%s largest_winner=%s:%s",
+        "Metrics refreshed mode=%s equity=%.2f deposits=%.2f withdrawals=%.2f net_funding=%.2f lifetime_pnl=%s return_on_deposits=%s expectancy=%s win_rate=%s closed_trades=%s projection_basis=%s projected_30d=%s positions=%d red=%d green=%d day_pnl=%s largest_loser=%s:%s largest_winner=%s:%s",
         metrics["mode"],
         equity,
         total_deposits,
@@ -1052,6 +1227,8 @@ def collect_metrics(session: requests.Session, cfg: Config) -> Dict[str, Any]:
         fmt_money(trades.get("expectancy")) if isinstance(trades, dict) else "—",
         fmt_pct(trades.get("win_rate")) if isinstance(trades, dict) else "—",
         trades.get("closed_trade_count") if isinstance(trades, dict) else "—",
+        projection.get("basis"),
+        fmt_money(projection.get("projected_30d_pnl")),
         positions["positions_count"],
         positions["red_positions"],
         positions["green_positions"],
@@ -1334,10 +1511,10 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
     history = metrics.get("history", {})
     trades = metrics.get("trades", {})
     risk = metrics.get("risk", {})
+    projection = metrics.get("projection", {})
 
     largest_loser = positions.get("largest_loser") or {}
     largest_winner = positions.get("largest_winner") or {}
-    uptime = duration_since_iso(state.get("started_at"))
 
     warning = ""
     if not cfg.dashboard_token:
@@ -1351,8 +1528,6 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
 
     exposure_sub = f"Cash: {fmt_pct(risk.get('cash_pct_of_equity'))} · Long: {fmt_pct(risk.get('long_exposure_pct_of_equity'))}"
     margin_sub = f"Initial: {fmt_pct(risk.get('initial_margin_pct_of_equity'))} · Maint: {fmt_pct(risk.get('maintenance_margin_pct_of_equity'))}"
-    account_flags = compact_status_flags(account, risk)
-
     cards = "\n".join(
         [
             metric_card("Equity", fmt_money(account.get("equity")), f"Mode: {metrics.get('mode', 'unknown')}", "Current Alpaca account equity / portfolio value."),
@@ -1363,6 +1538,12 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
             metric_card("Profit factor", fmt_num(trades.get("profit_factor"), 2), f"Gross profit / gross loss", "Above 1 means closed winners are larger than closed losers in aggregate. Blank means there are no losses yet or not enough data."),
             metric_card("Realized P/L", fmt_money(trades.get("realized_pnl")), f"Since {trades.get('trade_activity_after', 'start')}", "Approximate realized P/L reconstructed from fill activities. This is not tax accounting."),
             metric_card("Avg winner / loser", f"{fmt_money(trades.get('avg_win'))} / {fmt_money(trades.get('avg_loss'))}", f"Avg hold: {fmt_num(trades.get('avg_hold_days'), 1)} days", "Average winner and average absolute loser from closed trades. Compare this with win rate to judge strategy quality."),
+            metric_card("Projected 30d P/L", fmt_money(projection.get("projected_30d_pnl")), f"Basis: {projection.get('basis', 'unavailable')}", "Run-rate estimate: what the next 30 days would look like if the selected historical rate continued. This is not a forecast or guarantee."),
+            metric_card("Projected 90d return", fmt_pct(projection.get("projected_90d_return")), f"90d P/L: {fmt_money(projection.get('projected_90d_pnl'))}", "Projected 90-day return on current equity using the same run-rate basis as the 30-day projection."),
+            metric_card("Trade pace", f"{fmt_num(projection.get('closed_trades_per_week'), 1)} / week", f"30d projected closes: {fmt_num(projection.get('projected_closed_trades_30d'), 1)}", "How frequently the strategy has been closing trades, based on FIFO-matched closed fills."),
+            metric_card("Break-even win rate", fmt_pct(projection.get("breakeven_win_rate")), f"Edge gap: {fmt_pct(projection.get('edge_gap'))}", "Win rate needed to break even given the current average winner and average loser. Edge gap is actual win rate minus break-even win rate."),
+            metric_card("Recovery needed", fmt_money(projection.get("recovery_needed")), f"Return needed: {fmt_pct(projection.get('recovery_return_needed'))}", "How much the account needs to gain to get back to the recent equity high-water mark."),
+            metric_card("Days to recover", fmt_num(projection.get("days_to_recover_high_water"), 1), f"Using projection basis", "Estimated days to regain the recent high-water mark if the selected positive run-rate continued. Blank if there is no drawdown or the run-rate is not positive."),
             metric_card("Net funding", fmt_money(profitability.get("net_funding")), f"Source: {cash_flows.get('source')}", "Deposits minus withdrawals from deduped Alpaca cash-flow activities, or NET_DEPOSITS_OVERRIDE if set."),
             metric_card("Total deposits", fmt_money(profitability.get("total_deposits")), f"Since {cash_flows.get('activity_after', 'start')}", "Total external cash found entering the account."),
             metric_card("Total withdrawals", fmt_money(profitability.get("total_withdrawals")), f"Cash-flow events: {cash_flows.get('activity_count', 0)}", "Total external cash found leaving the account."),
@@ -1374,9 +1555,6 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
             metric_card("Open unrealized P/L", fmt_money(profitability.get("unrealized_pl_open_positions")), f"Positions: {positions.get('positions_count', 0)}", "Open-position P/L that has not been realized through sells yet."),
             metric_card("Red / Green", f"{positions.get('red_positions', 0)} / {positions.get('green_positions', 0)}", "Open positions", "Count of open positions with negative versus positive unrealized P/L."),
             metric_card("Largest loser / winner", f"{safe_text(largest_loser.get('symbol') or '—')} / {safe_text(largest_winner.get('symbol') or '—')}", f"{fmt_pct(largest_loser.get('unrealized_plpc')) if largest_loser else '—'} / {fmt_pct(largest_winner.get('unrealized_plpc')) if largest_winner else '—'}", "Single worst and best open position by unrealized percentage. Kept as a quick warning signal, not a full positions table."),
-            metric_card("Refresh runtime", fmt_duration(metrics.get("runtime_seconds")), f"Refresh count: {state.get('refresh_count', 0)}", "How long the last metrics refresh took. If this grows, the bot may be pulling too much activity history."),
-            metric_card("Bot uptime", fmt_duration(uptime), f"Last refresh: {safe_text(state.get('last_refresh_finished_at') or '—')}", "How long the Railway service has been running since the last restart/deploy."),
-            metric_card("Account flags", account_flags, f"Day trades: {risk.get('daytrade_count')}", "Shows PDT/trading/transfer/account block flags returned by Alpaca."),
         ]
     )
 
@@ -1385,6 +1563,7 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
             line_chart("Equity trend", history.get("equity_series") or [], value_kind="money", help_text="Recent account equity from Alpaca portfolio history."),
             line_chart("Drawdown trend", history.get("drawdown_series") or [], value_kind="percent", help_text="Drop from the recent equity high-water mark. Lower means deeper drawdown."),
             bar_chart("Recent closed-trade P/L", trades.get("recent_closed_trades") or [], help_text="Approximate realized P/L for the most recent closed trades, FIFO-matched from FILL activities."),
+            line_chart("Projected equity path", [(row.get("date"), row.get("projected_equity")) for row in (projection.get("projected_equity_series") or [])], value_kind="money", help_text="Run-rate projection from the selected basis. This visualizes continuation math, not a promise of future returns."),
         ]
     )
 
@@ -1450,6 +1629,7 @@ def render_dashboard(metrics: Dict[str, Any], state: Dict[str, Any], cfg: Config
           <p>{safe_text(token_note)}</p>
           <p>Lifetime P/L uses: current equity + total withdrawals - total deposits. The funding calculation is deduped and excludes fills, dividends, interest, fees, and market P/L.</p>
           <p>Expectancy is approximate FIFO matching from Alpaca FILL activities since {safe_text(trades.get('trade_activity_after', 'start'))}. It is meant for strategy health, not tax accounting.</p>
+          <p>Projected returns are simple run-rate estimates, not guarantees. Projection basis: {safe_text(projection.get('basis', 'unavailable'))}. Cash flows can distort recent equity-trend projections.</p>
           <p>Cash-flow activity types checked: {safe_text(','.join(cash_flows.get('activity_types_checked') or []))}. Raw activities: {safe_text(cash_flows.get('raw_activity_count'))}; duplicates skipped: {safe_text(cash_flows.get('duplicate_activity_count'))}; ignored: {safe_text(cash_flows.get('ignored_activity_count'))}.</p>
           <p>Set NET_DEPOSITS_OVERRIDE only if Alpaca activities still do not match your actual funding history. Use TRADE_ACTIVITY_AFTER if expectancy pulls too much old fill history.</p>
           <p>Version: {safe_text(metrics.get('app_version'))}.</p>
